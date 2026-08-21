@@ -23,7 +23,7 @@ public class BlockOnBlockExplodedPatch {
     public static void Postfix(Block __instance, IWorldAccessor world, BlockPos pos, BlockPos explosionCenter, EnumBlastType blastType, string ignitedByPlayerUid, PatchState __state) {
         string? playername = null;
         if (ignitedByPlayerUid != null)
-            playername = Main.CachedPlayerUsernames[ignitedByPlayerUid];
+            Main.CachedPlayerUsernames.TryGetValue(ignitedByPlayerUid, out playername);
 
         Vec3i blockPosition = pos.ToLocalPosition(Main.API);
 
