@@ -302,14 +302,14 @@ public class Database : IDisposable {
 
             using var cmd = connection.CreateCommand();
 
-            string? playerid = null;
-            cmd.CommandText = @"SELECT * FROM players
+            long playerid = -1;
+            cmd.CommandText = @"SELECT id FROM players
             WHERE last_playername = $playername";
             cmd.Parameters.AddWithValue("$playername", playername);
             using (var reader = cmd.ExecuteReader()) {
                 if (reader.HasRows) {
                     while (reader.Read()) {
-                        playerid = reader.GetString(0);
+                        playerid = reader.GetInt64(0);
                         break;
                     }
                 }
