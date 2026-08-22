@@ -1,6 +1,7 @@
 using HarmonyLib;
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using Vintagestory.API.Common;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
@@ -28,12 +29,20 @@ namespace GriefWarden;
 /// produces a fire that is indistinguishable from lightning and ignores claims completely.
 /// On a 200-mod pack that is not hypothetical.
 ///
-/// So: watch lightning strikes directly, through the public event the weather system already
-/// exposes, and treat unattributed fire near a recent strike as natural. Everything else
-/// unattributed is an unknown source and gets the protection vanilla skips.
+/// So: watch lightning strikes through the public event the weather system already exposes,
+/// and STAMP the fire they create with a sentinel uid. Vanilla then treats it exactly as it
+/// treats null, because the sentinel resolves to no player, while we can still tell the two
+/// apart. Anything unattributed that carries no sentinel is an unknown source and gets the
+/// protection vanilla skips.
+///
+/// Stamping rather than remembering where lightning struck is the important choice. Natural
+/// fire burns and spreads for minutes and travels far past any sane radius; a proximity
+/// window would stop recognising it partway through and start treating it as a mod fire.
+/// The sentinel rides along instead, because vanilla already propagates that field to every
+/// fire it spreads to and already persists it, so it survives distance and restarts for free.
 ///
 /// This is deliberately additive. It never blocks anything vanilla would allow for an
-/// attributed fire, and it never touches the lightning path itself.
+/// attributed fire, and it never changes what the lightning path does.
 /// </summary>
 public class FireGuard {
     private readonly GriefWardenConfig config;
@@ -87,14 +96,89 @@ public class FireGuard {
         );
     }
 
+    /// <summary>
+    /// The sentinel written into startedByPlayerUid on lightning fire.
+    ///
+    /// This is the whole trick. Vanilla treats a uid that resolves to no player exactly as
+    /// it treats null: PlayerByUid returns null, so TrySpreadTo's claim test is skipped and
+    /// the fire spreads naturally. But unlike null, a value is CARRIED. Vanilla already
+    /// passes startedByPlayerUid to every fire it spreads to and already persists it to tree
+    /// attributes, so a lightning fire stays recognisable as lightning fifty blocks and one
+    /// restart later, with no bookkeeping on our side.
+    ///
+    /// A proximity-and-time window cannot do this. Natural fire burns and spreads for
+    /// minutes and travels far past any sane radius, and the moment it left that window it
+    /// would stop looking like lightning and start looking like an unknown source.
+    ///
+    /// The colon guarantees it can never collide with a real player uid.
+    /// </summary>
+    public const string LightningUid = "griefwarden:lightning";
+
+    private static readonly FieldInfo StartedByField =
+        AccessTools.Field(typeof(BEBehaviorBurning), "startedByPlayerUid");
+
     private void OnLightning(ref Vec3d impactPos, ref EnumHandling handling) {
-        // Purely an observer. Handling is left exactly as found so this cannot change
-        // whether lightning does anything.
+        // Purely an observer. Handling is left exactly as found, so this cannot change
+        // whether lightning does anything at all.
         long now = Main.API.World.ElapsedMilliseconds;
         long cutoff = now - config.LightningGraceSeconds * 1000L;
+        var at = impactPos.Clone();
         lock (strikeLock) {
             strikes.RemoveAll(s => s.AtMs < cutoff);
-            strikes.Add((impactPos.Clone(), now));
+            strikes.Add((at, now));
+        }
+
+        // Vanilla creates its fire during this same event, and whether our handler runs
+        // before or after it depends on subscription order we do not control. Stamping on
+        // the next tick sidesteps that entirely: by then the fire exists either way.
+        Main.API.Event.RegisterCallback(_ => StampLightningFires(at.AsBlockPos), 50);
+    }
+
+    /// <summary>
+    /// Mark fresh unattributed fire around a strike as lightning-born.
+    ///
+    /// Vanilla ignites within one block of the impact and then from the faces of that block,
+    /// so everything it lights is within two. Three gives margin without reaching far enough
+    /// to adopt a player's fire that happened to be burning nearby.
+    /// </summary>
+    private void StampLightningFires(BlockPos impact) {
+        try {
+            int r = 3;
+            var pos = new BlockPos(impact.dimension);
+            int stamped = 0;
+
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dy = -r; dy <= r; dy++) {
+                    for (int dz = -r; dz <= r; dz++) {
+                        pos.Set(impact.X + dx, impact.Y + dy, impact.Z + dz);
+                        var be = Main.API.World.BlockAccessor.GetBlockEntity(pos);
+                        var burning = be?.GetBehavior<BEBehaviorBurning>();
+                        if (burning == null) continue;
+
+                        // Only claim fire that nobody owns. A player's fire near a strike
+                        // keeps its attribution and stays subject to the claim test.
+                        string existing = StartedByField?.GetValue(burning) as string;
+                        if (!string.IsNullOrEmpty(existing)) continue;
+
+                        StartedByField?.SetValue(burning, LightningUid);
+                        be.MarkDirty(false);
+                        stamped++;
+                    }
+                }
+            }
+
+            if (stamped > 0) {
+                ObservedLightning += stamped;
+                Main.API.Logger.Notification(
+                    $"GriefWarden: marked {stamped} lightning fire(s) at {impact} as natural. They will spread without claim checks."
+                );
+            }
+        }
+        catch (Exception ex) {
+            // Failing here means natural fire looks like an unknown source. In observe mode
+            // that is a log line; in enforce mode it would wrongly stop a natural fire, so
+            // it is worth shouting about.
+            Main.API.Logger.Error("GriefWarden: could not mark lightning fire, it may be treated as an unknown source: " + ex);
         }
     }
 
@@ -117,6 +201,9 @@ public class FireGuard {
     /// Decide whether an unattributed fire may spread to a position. Returns true to allow.
     /// </summary>
     private bool AllowUnattributedSpread(BlockPos pos) {
+        // Belt and braces for the one tick between a strike and the stamp landing. After
+        // that the sentinel on the fire itself is what identifies natural fire, and this
+        // window stops mattering.
         if (NearRecentStrike(pos)) {
             ObservedLightning++;
             return true;
@@ -174,7 +261,13 @@ public class FireGuard {
             var guard = instance;
             if (guard == null || !guard.config.FireGuardEnabled) return true;
 
-            // Attributed: vanilla's own claim test handles it, and handles it correctly.
+            // Lightning, carried on the fire itself rather than inferred from where and when
+            // it started. Natural fire spreads without a claim check no matter how far it has
+            // travelled or how long it has been burning.
+            if (___startedByPlayerUid == LightningUid) return true;
+
+            // Attributed to a real player: vanilla's own claim test handles it, and handles
+            // it correctly, including letting an owner's fire spread into their own claim.
             if (!string.IsNullOrEmpty(___startedByPlayerUid)) return true;
 
             try {
