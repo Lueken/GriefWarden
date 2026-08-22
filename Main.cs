@@ -25,6 +25,11 @@ public class Main : ModSystem {
 
         new Commands();
 
+        // Quire-local: snapshots land claims beside the database so off-server analysis can
+        // tell a break on unclaimed fringe from a break in the middle of nowhere. Not part
+        // of the retention work meant for upstream.
+        new ClaimsExport();
+
         API.Event.PlayerJoin += OnPlayerJoin;
 
         harmony = new Harmony(Mod.Info.ModID);
