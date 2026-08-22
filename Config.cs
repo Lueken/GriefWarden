@@ -59,6 +59,40 @@ public class GriefWardenConfig {
     /// </summary>
     public bool VacuumAfterPrune = false;
 
+    // ----------------------------------------------------------------- fire guard
+    /// <summary>
+    /// Watch fire that has no player attached to it.
+    ///
+    /// Vanilla already stops a player-lit fire crossing into a claim they cannot build in,
+    /// and already lets lightning burn freely. The gap is fire from a mod, which arrives
+    /// unattributed and is therefore treated as lightning and skips the claim test.
+    /// </summary>
+    public bool FireGuardEnabled = true;
+
+    /// <summary>
+    /// False logs what it would have blocked and blocks nothing. True actually refuses the
+    /// spread.
+    ///
+    /// Default false on purpose. A pack this size will have legitimate mod fire, and finding
+    /// out which by breaking it is the wrong order. Run in observe for a few weeks, read the
+    /// log lines, then decide.
+    /// </summary>
+    public bool FireGuardEnforce = false;
+
+    /// <summary>
+    /// How long after a lightning strike unattributed fire near it still counts as natural.
+    /// The vanilla lightning system creates its fire in the same tick as the impact, so this
+    /// only needs to cover the fire then spreading outward.
+    /// </summary>
+    public int LightningGraceSeconds = 30;
+
+    /// <summary>
+    /// How far from a strike unattributed fire still counts as natural. Vanilla ignites
+    /// within one block of the impact and the fire spreads from there, so this is a spread
+    /// allowance rather than a strike radius.
+    /// </summary>
+    public int LightningGraceRadius = 12;
+
     public void Clamp() {
         // A zero or negative retention would delete everything on the next tick. Refuse
         // rather than obey: this is the one setting where a typo is unrecoverable.
@@ -67,6 +101,8 @@ public class GriefWardenConfig {
         if (PruneIntervalHours < 1) PruneIntervalHours = 1;
         if (PruneBatchSize < 100) PruneBatchSize = 100;
         if (MaxDatabaseMb < 16) MaxDatabaseMb = 16;
+        if (LightningGraceSeconds < 1) LightningGraceSeconds = 1;
+        if (LightningGraceRadius < 1) LightningGraceRadius = 1;
 
         // Keeping context longer than evidence is almost certainly a mistake, and it would
         // leave the log full of block placements with the breaks pruned out from under them.

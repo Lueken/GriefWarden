@@ -19,7 +19,7 @@ public class Commands {
         Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
         Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
         Main.API.RegisterCommand("tpboatid", "Performs a sequence of events to teleport a boat to you.", "-e ENTITYID", new ServerChatCommandDelegate(this.OnTPBoatID), "griefwarden");
-        Main.API.RegisterCommand("griefwarden", "GriefWarden status and retention control.", "status | prune | vacuum", new ServerChatCommandDelegate(this.OnGriefWardenCommand), "griefwarden");
+        Main.API.RegisterCommand("griefwarden", "GriefWarden status and retention control.", "status | prune | vacuum | fire", new ServerChatCommandDelegate(this.OnGriefWardenCommand), "griefwarden");
     }
 
     /// <summary>
@@ -36,11 +36,16 @@ public class Commands {
         switch (sub) {
             case "status":
                 Main.API.SendMessage(player, groupId, Main.Retention.Describe(), EnumChatType.CommandSuccess);
+                Main.API.SendMessage(player, groupId, Main.FireGuard.Describe(), EnumChatType.CommandSuccess);
                 return;
 
             case "prune":
                 Main.Retention.Run("command");
                 Main.API.SendMessage(player, groupId, "Retention pass queued. server-main.log records what it removed.", EnumChatType.CommandSuccess);
+                return;
+
+            case "fire":
+                Main.API.SendMessage(player, groupId, Main.FireGuard.Describe(), EnumChatType.CommandSuccess);
                 return;
 
             case "vacuum":
@@ -49,7 +54,7 @@ public class Commands {
                 return;
 
             default:
-                Main.API.SendMessage(player, groupId, "Usage: /griefwarden status | prune | vacuum", EnumChatType.CommandError);
+                Main.API.SendMessage(player, groupId, "Usage: /griefwarden status | prune | vacuum | fire", EnumChatType.CommandError);
                 return;
         }
     }

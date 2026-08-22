@@ -16,6 +16,7 @@ public class Main : ModSystem {
     public static Dictionary<string, string> CachedPlayerUsernames { get; private set; } = new();
     public static GriefWardenConfig Config { get; private set; }
     public static Retention Retention { get; private set; }
+    public static FireGuard FireGuard { get; private set; }
 
     public override bool ShouldLoad(EnumAppSide forSide) {
         return forSide == EnumAppSide.Server;
@@ -48,6 +49,10 @@ public class Main : ModSystem {
 
         harmony = new Harmony(Mod.Info.ModID);
         harmony.PatchAll();
+
+        // After PatchAll: the guard's Harmony patch is picked up by that call, and its
+        // constructor only wires the lightning observer and logs what mode it is in.
+        FireGuard = new FireGuard(Config, harmony);
     }
 
     public override void Dispose() {
