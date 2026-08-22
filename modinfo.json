@@ -7,7 +7,7 @@
         "Windwhistle"
     ],
     "description": "Keeps an in-game accessible log of various types of things done in-game.",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "side": "Server",
     "requiredOnClient": false,
     "requiredOnServer": true

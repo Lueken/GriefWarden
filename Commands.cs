@@ -19,6 +19,39 @@ public class Commands {
         Main.API.RegisterCommand("entitylog", "Inspect entity logs in radius around you.", "(-r # OR -e ENTITYID) -p #", new ServerChatCommandDelegate(this.OnEntityLogCommand), "griefwarden");
         Main.API.RegisterCommand("containerlog", "Inspect container logs at container looked at.", "-p #", new ServerChatCommandDelegate(this.OnContainerLogCommand), "griefwarden");
         Main.API.RegisterCommand("tpboatid", "Performs a sequence of events to teleport a boat to you.", "-e ENTITYID", new ServerChatCommandDelegate(this.OnTPBoatID), "griefwarden");
+        Main.API.RegisterCommand("griefwarden", "GriefWarden status and retention control.", "status | prune | vacuum", new ServerChatCommandDelegate(this.OnGriefWardenCommand), "griefwarden");
+    }
+
+    /// <summary>
+    /// Status and manual retention control, so the policy can be inspected and forced without
+    /// a restart.
+    ///
+    /// Vacuum is manual on purpose. It rewrites the whole database and needs roughly double
+    /// the file size in scratch, which is a visible hitch on a live server and not something
+    /// that belongs on a timer.
+    /// </summary>
+    private void OnGriefWardenCommand(IServerPlayer player, int groupId, CmdArgs args) {
+        string sub = (args.PopWord() ?? "status").ToLowerInvariant();
+
+        switch (sub) {
+            case "status":
+                Main.API.SendMessage(player, groupId, Main.Retention.Describe(), EnumChatType.CommandSuccess);
+                return;
+
+            case "prune":
+                Main.Retention.Run("command");
+                Main.API.SendMessage(player, groupId, "Retention pass queued. server-main.log records what it removed.", EnumChatType.CommandSuccess);
+                return;
+
+            case "vacuum":
+                Main.API.SendMessage(player, groupId, "Vacuum queued. The server may hitch while the database is rewritten.", EnumChatType.CommandSuccess);
+                Main.Retention.RunVacuum("command");
+                return;
+
+            default:
+                Main.API.SendMessage(player, groupId, "Usage: /griefwarden status | prune | vacuum", EnumChatType.CommandError);
+                return;
+        }
     }
 
     private void OnRollbackBreaksCommand(IServerPlayer player, int groupId, CmdArgs args) {

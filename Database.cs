@@ -758,6 +758,28 @@ public class Database : IDisposable {
         });
     }
 
+    /// <summary>
+    /// Queue maintenance work onto the existing writer thread.
+    ///
+    /// Retention has to run on this connection rather than opening its own. The worker is
+    /// the only writer, so anything queued here is serialised against every insert for free;
+    /// a second write connection would instead contend with it and produce SQLITE_BUSY under
+    /// exactly the load that makes pruning worth doing.
+    /// </summary>
+    public void EnqueueMaintenance(Action<SqliteConnection> task) {
+        databaseTasks.Enqueue(task);
+    }
+
+    /// <summary>Current file size on disk, for the retention size backstop.</summary>
+    public long FileSizeBytes() {
+        try {
+            return new FileInfo(dbPath).Length;
+        }
+        catch {
+            return 0;
+        }
+    }
+
     public void Dispose() {
         cancellationTokenSource.Cancel();
         workerThread.Join(5000); // Wait up to 5 seconds for worker to finish
