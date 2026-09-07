@@ -52,10 +52,24 @@ public class FireGuard {
     private readonly List<(Vec3d Pos, long AtMs)> strikes = new();
     private readonly object strikeLock = new();
 
+    /// <summary>Observe-mode log throttle, keyed by claim owner.
+    ///
+    /// The first version logged every evaluation, and TrySpreadTo is a hot path: a single
+    /// roasting heap inside one claim produced 52,528 lines in 44 seconds across 32
+    /// positions on 2026-09-07, twelve megabytes of log written from the server thread.
+    /// The point of observe mode is that an owner learns WHAT produces unattributed fire,
+    /// which one line plus a count says as well as fifty thousand do.</summary>
+    private readonly Dictionary<string, (long FirstMs, long LastLoggedMs, int Suppressed, BlockPos Sample)> observed = new();
+    private readonly object observedLock = new();
+
+    /// <summary>How long one claim's unattributed fire stays folded into a single report.</summary>
+    private const long ObserveWindowMs = 60_000;
+
     private static FireGuard instance;
 
     public int ObservedUnattributed { get; private set; }
     public int ObservedLightning { get; private set; }
+    public int ObservedInPlace { get; private set; }
     public int BlockedSpreads { get; private set; }
 
     public FireGuard(GriefWardenConfig config, Harmony harmony) {
@@ -200,7 +214,7 @@ public class FireGuard {
     /// <summary>
     /// Decide whether an unattributed fire may spread to a position. Returns true to allow.
     /// </summary>
-    private bool AllowUnattributedSpread(BlockPos pos) {
+    private bool AllowUnattributedSpread(BlockPos pos, BlockPos? source) {
         // Belt and braces for the one tick between a strike and the stamp landing. After
         // that the sentinel on the fire itself is what identifies natural fire, and this
         // window stops mattering.
@@ -213,23 +227,77 @@ public class FireGuard {
         LandClaim[] claimsHere = Main.API.World.Claims.Get(pos);
         if (claimsHere == null || claimsHere.Length == 0) return true;
 
+        // ALREADY INSIDE. Grief by mod fire means fire crossing INTO a claim it did not
+        // start in; fire already burning within the same claim is the owner's own business,
+        // and on a modded pack it is nearly always an appliance they built and lit on their
+        // own land. IndustrialStory's roasting heap is the case that surfaced this: it burns
+        // through BEBehaviorBurning and never sets startedByPlayerUid, so every roast inside
+        // a claim read as an unknown mod source (2026-09-07). Checked per spread rather than
+        // stamped onto the fire, deliberately: a sentinel would ride along and let that same
+        // fire cross into a NEIGHBOUR's claim unchecked, which is the thing being guarded.
+        if (source != null) {
+            LandClaim[] claimsThere = Main.API.World.Claims.Get(source);
+            if (claimsThere != null && claimsThere.Length > 0 && SameOwner(claimsHere, claimsThere)) {
+                ObservedInPlace++;
+                return true;
+            }
+        }
+
         ObservedUnattributed++;
 
         string owner = claimsHere[0].LastKnownOwnerName ?? claimsHere[0].OwnedByPlayerUid ?? "unknown";
         string verdict = config.FireGuardEnforce ? "BLOCKED" : "would block (observe mode)";
-
-        // Logged either way. Observe mode exists so a server owner learns what actually
-        // produces unattributed fire on their pack before switching on something that can
-        // stop a legitimate mechanic, and the log line is the whole point of that mode.
-        Main.API.Logger.Notification(
-            $"GriefWarden: {verdict} unattributed fire spreading into {owner}'s claim at {pos}. " +
-            "No player on the fire and no recent lightning, so the source is a mod."
-        );
+        ReportThrottled(owner, verdict, pos);
 
         if (!config.FireGuardEnforce) return true;
 
         BlockedSpreads++;
         return false;
+    }
+
+    /// <summary>True when two claim sets share an owner. Overlapping claims are rare but
+    /// legal, so this compares every pair rather than just the first of each.</summary>
+    private static bool SameOwner(LandClaim[] a, LandClaim[] b) {
+        foreach (var x in a) {
+            if (string.IsNullOrEmpty(x.OwnedByPlayerUid)) continue;
+            foreach (var y in b) {
+                if (x.OwnedByPlayerUid == y.OwnedByPlayerUid) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>One line per claim per window, with the count of everything folded into it.
+    /// The first hit reports immediately so nothing is hidden; the rest are counted and
+    /// summarised when the window closes.</summary>
+    private void ReportThrottled(string owner, string verdict, BlockPos pos) {
+        long now = Main.API.World.ElapsedMilliseconds;
+        bool logNow;
+        int suppressed = 0;
+        BlockPos sample = pos;
+
+        lock (observedLock) {
+            if (!observed.TryGetValue(owner, out var state) || now - state.LastLoggedMs >= ObserveWindowMs) {
+                suppressed = state.Suppressed;
+                sample = state.Sample ?? pos;
+                observed[owner] = (now, now, 0, pos);
+                logNow = true;
+            }
+            else {
+                observed[owner] = (state.FirstMs, state.LastLoggedMs, state.Suppressed + 1, state.Sample ?? pos);
+                logNow = false;
+            }
+        }
+
+        if (!logNow) return;
+
+        string tail = suppressed > 0
+            ? $" ({suppressed} further attempt(s) in the previous minute, around {sample}, not logged separately)"
+            : "";
+        Main.API.Logger.Notification(
+            $"GriefWarden: {verdict} unattributed fire spreading into {owner}'s claim at {pos}. " +
+            "No player on the fire and no recent lightning, so the source is a mod." + tail
+        );
     }
 
     public string Describe() {
@@ -238,6 +306,7 @@ public class FireGuard {
         return $"Fire guard {(config.FireGuardEnforce ? "ENFORCING" : "observing")}. "
              + $"lightningFires is {(lightningFires ? "on" : "off")}. "
              + $"Since restart: {ObservedUnattributed} unattributed spreads into claims, "
+             + $"{ObservedInPlace} allowed as already inside their own claim, "
              + $"{ObservedLightning} excused as lightning, {BlockedSpreads} blocked.";
     }
 
@@ -257,7 +326,7 @@ public class FireGuard {
     /// </summary>
     [HarmonyPatch(typeof(BEBehaviorBurning), nameof(BEBehaviorBurning.TrySpreadTo))]
     public static class TrySpreadToPatch {
-        public static bool Prefix(BlockPos pos, string ___startedByPlayerUid, ref bool __result) {
+        public static bool Prefix(BEBehaviorBurning __instance, BlockPos pos, string ___startedByPlayerUid, ref bool __result) {
             var guard = instance;
             if (guard == null || !guard.config.FireGuardEnabled) return true;
 
@@ -271,7 +340,7 @@ public class FireGuard {
             if (!string.IsNullOrEmpty(___startedByPlayerUid)) return true;
 
             try {
-                if (guard.AllowUnattributedSpread(pos)) return true;
+                if (guard.AllowUnattributedSpread(pos, __instance?.Blockentity?.Pos)) return true;
                 __result = false;
                 return false; // skip the original: this spread does not happen
             }
