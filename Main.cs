@@ -17,6 +17,8 @@ public class Main : ModSystem {
     public static GriefWardenConfig Config { get; private set; }
     public static Retention Retention { get; private set; }
     public static FireGuard FireGuard { get; private set; }
+    public static Queries Queries { get; private set; }
+    public static Rollback Rollback { get; private set; }
 
     public override bool ShouldLoad(EnumAppSide forSide) {
         return forSide == EnumAppSide.Server;
@@ -31,8 +33,18 @@ public class Main : ModSystem {
 
         Database = new Database();
 
+        // Read paths that answer "what did this player do" rather than "what happened at
+        // this block". They open their own read-only connections, so this only needs the
+        // path the writer settled on.
+        Queries = new Queries(Database.DbPath);
+        Rollback = new Rollback(Database.DbPath);
+
         new BlockHooks();
         new EntityHooks();
+
+        // Presence and chat. Both answer questions the block log cannot: whether a player
+        // was connected when something was said, and what was said.
+        new PlayerHooks();
 
         new Commands();
 

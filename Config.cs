@@ -59,6 +59,77 @@ public class GriefWardenConfig {
     /// </summary>
     public bool VacuumAfterPrune = false;
 
+    // ----------------------------------------------------------------- rendering
+    /// <summary>
+    /// Minutes to shift timestamps by when printing them. Zero prints UTC and says so.
+    ///
+    /// The timestamps themselves are always stored as true UTC; this only changes what an
+    /// admin reads. Set it to the timezone your staff actually live in: -420 for UTC-7,
+    /// 60 for UTC+1. Every rendered line carries its offset either way, because an
+    /// unlabelled time is the one thing in a grief log that can be confidently misread.
+    /// </summary>
+    public int DisplayUtcOffsetMinutes = 0;
+
+    /// <summary>
+    /// Rows per page in the log commands.
+    ///
+    /// The original was four, hardcoded. Four is not a page, it is a glimpse: a single
+    /// chest in an active town can carry a hundred rows in a morning, and paging through
+    /// that four at a time is why investigations ended up being done in SQL instead. Twelve
+    /// fits a chat window without scrolling the conversation away.
+    /// </summary>
+    public int LogPageSize = 12;
+
+    /// <summary>
+    /// Default window for the commands that take -t, when it is not given.
+    ///
+    /// Not unbounded, on purpose. "Everything ever" is almost never the question, and
+    /// answering it by default is how a command becomes something people stop running.
+    /// </summary>
+    public int DefaultWindowHours = 24;
+
+    /// <summary>
+    /// Hard ceiling on rows scanned by the item search, which has to decompress each
+    /// candidate to match it and so cannot push the filter into SQL.
+    ///
+    /// When the cap is hit the command says so. A truncated search that reports itself is
+    /// usable; one that quietly stops reads as proof an item was never touched.
+    /// </summary>
+    public int ItemSearchScanLimit = 250000;
+
+    // ----------------------------------------------------------------- presence and chat
+    /// <summary>
+    /// Record join and disconnect times.
+    ///
+    /// "Was he online when it was said in chat" decides whether someone ignored an
+    /// instruction or never saw it, and without this table the only way to answer it is to
+    /// count their world actions around that minute and reason from the gaps. Two rows per
+    /// login; the table is the cheapest thing in the database.
+    /// </summary>
+    public bool LogSessions = true;
+
+    /// <summary>
+    /// Record public chat.
+    ///
+    /// Rulings turn on what was said and when, and the server's own chat log is a separate
+    /// file with no shared index, so correlating it with the event log is manual work every
+    /// single time. Storing it beside the events makes "what was said while this was
+    /// happening" one query.
+    ///
+    /// Off is a legitimate choice. This is the most personal data the mod touches, which is
+    /// also why it gets its own shorter retention below rather than riding the evidence tier.
+    /// </summary>
+    public bool LogChat = true;
+
+    /// <summary>
+    /// How long to keep chat. Deliberately short and separate from everything else.
+    ///
+    /// Chat earns its place by explaining events that are being investigated now. It does
+    /// not earn an indefinite transcript of a community talking, so this does not inherit
+    /// the 90-day evidence window even though the events it explains do.
+    /// </summary>
+    public int ChatRetentionDays = 21;
+
     // ----------------------------------------------------------------- fire guard
     /// <summary>
     /// Watch fire that has no player attached to it.
@@ -98,6 +169,16 @@ public class GriefWardenConfig {
         // rather than obey: this is the one setting where a typo is unrecoverable.
         if (DestructiveRetentionDays < 1) DestructiveRetentionDays = 1;
         if (ContextRetentionDays < 1) ContextRetentionDays = 1;
+        if (ChatRetentionDays < 1) ChatRetentionDays = 1;
+        if (LogPageSize < 1) LogPageSize = 1;
+        if (LogPageSize > 50) LogPageSize = 50;   // beyond this the client drops chat lines
+        if (DefaultWindowHours < 1) DefaultWindowHours = 1;
+        if (ItemSearchScanLimit < 1000) ItemSearchScanLimit = 1000;
+
+        // Real offsets run UTC-12 to UTC+14. Anything outside that is a typo, and a typo
+        // here silently relabels every timestamp an admin reads.
+        if (DisplayUtcOffsetMinutes < -720) DisplayUtcOffsetMinutes = -720;
+        if (DisplayUtcOffsetMinutes > 840) DisplayUtcOffsetMinutes = 840;
         if (PruneIntervalHours < 1) PruneIntervalHours = 1;
         if (PruneBatchSize < 100) PruneBatchSize = 100;
         if (MaxDatabaseMb < 16) MaxDatabaseMb = 16;

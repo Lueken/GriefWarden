@@ -26,7 +26,20 @@ public class Retention {
         (int)Database.ActionType.TAKEN,
     };
 
-    private static readonly string[] Tables = { "blocklogs", "entitylogs", "containerlogs" };
+    // Tables where the cutoff depends on what the row records: a BROKE is evidence, a
+    // PLACED is context, and they sit side by side in the same table.
+    private static readonly string[] Tiered = { "blocklogs", "entitylogs", "containerlogs" };
+
+    // Tables where every row is the same class of thing, so the whole table shares one
+    // cutoff. Sessions ride the evidence window because presence is what pairs with an old
+    // break; chat gets its own shorter window because a transcript of a community talking
+    // is not something to keep for a quarter on the chance it becomes relevant.
+    private static readonly string[] WholeTable = { "sessions", "chatlogs", "containersnapshots" };
+
+    // Everything, for the size backstop only.
+    private static readonly string[] AllTables = {
+        "blocklogs", "entitylogs", "containerlogs", "sessions", "chatlogs", "containersnapshots"
+    };
 
     private readonly GriefWardenConfig config;
     private bool running;
@@ -45,7 +58,7 @@ public class Retention {
         Main.API.Event.RegisterGameTickListener(_ => Run("scheduled"), config.PruneIntervalHours * 3600 * 1000);
 
         Main.API.Logger.Notification(
-            $"GriefWarden: retention on. Destructive {config.DestructiveRetentionDays}d, context {config.ContextRetentionDays}d, ceiling {config.MaxDatabaseMb} MB."
+            $"GriefWarden: retention on. Destructive+presence {config.DestructiveRetentionDays}d, context {config.ContextRetentionDays}d, chat {config.ChatRetentionDays}d, ceiling {config.MaxDatabaseMb} MB."
         );
     }
 
@@ -74,11 +87,12 @@ public class Retention {
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         long destructiveCutoff = now - (long)config.DestructiveRetentionDays * 86400;
         long contextCutoff = now - (long)config.ContextRetentionDays * 86400;
+        long chatCutoff = now - (long)config.ChatRetentionDays * 86400;
 
         var deleted = new Dictionary<string, int>();
         int total = 0;
 
-        foreach (string table in Tables) {
+        foreach (string table in Tiered) {
             // Two passes per table because the cutoff depends on what the row records, not
             // on which table it landed in. Container TAKEN is evidence; container PLACED is
             // someone tidying their own chest.
@@ -86,6 +100,11 @@ public class Retention {
                 DeleteOlderThan(connection, table, destructiveCutoff, Destructive, include: true);
             total += deleted[table + ":context"] =
                 DeleteOlderThan(connection, table, contextCutoff, Destructive, include: false);
+        }
+
+        foreach (string table in WholeTable) {
+            long cutoff = table == "chatlogs" ? chatCutoff : destructiveCutoff;
+            total += deleted[table] = DeleteAllOlderThan(connection, table, cutoff);
         }
 
         if (total > 0) {
@@ -137,6 +156,30 @@ public class Retention {
     }
 
     /// <summary>
+    /// Delete rows older than a cutoff regardless of action type, for tables where every
+    /// row is the same class of thing. Batched for the same reason as the tiered delete: an
+    /// unbounded DELETE holds the write lock long enough to stall logging.
+    /// </summary>
+    private int DeleteAllOlderThan(SqliteConnection connection, string table, long cutoff) {
+        int removed = 0;
+
+        while (true) {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText =
+                $@"DELETE FROM {table} WHERE id IN (
+                     SELECT id FROM {table} WHERE timestamp_utc < $cutoff LIMIT $batch
+                   )";
+            cmd.Parameters.AddWithValue("$cutoff", cutoff);
+            cmd.Parameters.AddWithValue("$batch", config.PruneBatchSize);
+
+            int n = cmd.ExecuteNonQuery();
+            removed += n;
+            if (n < config.PruneBatchSize) break;
+        }
+        return removed;
+    }
+
+    /// <summary>
     /// The backstop. If age-based pruning left the file over the ceiling, drop the oldest
     /// rows regardless of class until it fits.
     ///
@@ -157,7 +200,7 @@ public class Retention {
         for (int round = 0; round < 40 && Main.Database.FileSizeBytes() > ceiling; round++) {
             int removed = 0;
             foreach (bool destructive in new[] { false, true }) {
-                foreach (string table in Tables) {
+                foreach (string table in AllTables) {
                     removed += DeleteOldestAny(connection, table, destructive);
                 }
             }
@@ -209,9 +252,9 @@ public class Retention {
     /// <summary>Row counts and cutoffs, for the status command.</summary>
     public string Describe() {
         if (!config.RetentionEnabled) return "Retention is disabled. The log grows without bound.";
-        return $"Destructive (BROKE/KILLED/TAKEN) kept {config.DestructiveRetentionDays} days, "
-             + $"everything else {config.ContextRetentionDays} days, ceiling {config.MaxDatabaseMb} MB, "
-             + $"pruning every {config.PruneIntervalHours}h. Database is currently "
-             + $"{Main.Database.FileSizeBytes() / 1048576.0:0.0} MB.";
+        return $"Destructive (BROKE/KILLED/TAKEN) and presence kept {config.DestructiveRetentionDays} days, "
+             + $"chat {config.ChatRetentionDays} days, everything else {config.ContextRetentionDays} days, "
+             + $"ceiling {config.MaxDatabaseMb} MB, pruning every {config.PruneIntervalHours}h. "
+             + $"Database is currently {Main.Database.FileSizeBytes() / 1048576.0:0.0} MB.";
     }
 }

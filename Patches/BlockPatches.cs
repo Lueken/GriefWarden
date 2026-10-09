@@ -17,6 +17,11 @@ public class BlockOnBlockExplodedPatch {
         __state = new PatchState();
         Block block = Main.API.World.BlockAccessor.GetBlock(pos);
         __state.oldBlockStr = block.ToString();
+
+        // Explosions never reach Event.BreakBlock, so a bombed storeroom would otherwise be
+        // the one destruction that leaves no manifest — and a bombed storeroom is the case
+        // most likely to need one.
+        ContainerSnapshot.Capture(pos);
     }
     
     [HarmonyPostfix]
@@ -28,6 +33,8 @@ public class BlockOnBlockExplodedPatch {
         Vec3i blockPosition = pos.ToLocalPosition(Main.API);
 
         Main.Database.AddBlockLog(playername, ignitedByPlayerUid, "BROKE", __state.oldBlockStr, blastType + "Bomb", blockPosition.X, blockPosition.Y, blockPosition.Z, null);
+
+        ContainerSnapshot.Commit(pos, playername, ignitedByPlayerUid, blockPosition.X, blockPosition.Y, blockPosition.Z);
     }
 
     public class PatchState {

@@ -14,7 +14,9 @@ namespace GriefWarden;
 
 public class Database : IDisposable {
     private string dbPath;
-    private int logLimit = 4;
+    // Page size is a config value now. It was 4, hardcoded, which is not a page: a single
+    // chest in an active town carries a hundred rows in a morning.
+    private int logLimit => Main.Config?.LogPageSize ?? 12;
 
     private Thread workerThread;
     private CancellationTokenSource cancellationTokenSource;
@@ -62,6 +64,69 @@ public class Database : IDisposable {
         quantity INTEGER,
         actiontype INTEGER
     )";
+    /// <summary>
+    /// Who was connected, and when.
+    ///
+    /// Presence is evidence on its own. Whether a player was online at the minute an
+    /// instruction was given in chat is the difference between ignoring it and never having
+    /// seen it, and until this table existed the only way to answer it was to count that
+    /// player's world actions around the timestamp and infer from the density.
+    ///
+    /// No IP address, on purpose. It would help with alt accounts and it is the one field
+    /// here that turns a grief log into something that matters if the file leaks.
+    /// </summary>
+    private string createSessionsTable = @"CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_utc INTEGER,
+        player_id INTEGER NULL,
+        actiontype INTEGER
+    )";
+    /// <summary>
+    /// Public chat, stored beside the events it explains.
+    ///
+    /// The server already writes server-chat.log, but that file shares no index, no player
+    /// id and no query path with any of this, so every investigation that turns on
+    /// something said in chat means opening a second file and aligning it by eye.
+    /// </summary>
+    private string createChatLogsTable = @"CREATE TABLE IF NOT EXISTS chatlogs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_utc INTEGER,
+        player_id INTEGER NULL,
+        channel INTEGER,
+        message_data BLOB NULL,
+        message_encoding INTEGER NOT NULL DEFAULT 0,
+        actiontype INTEGER
+    )";
+    /// <summary>
+    /// What was inside a container when it was destroyed.
+    ///
+    /// A separate table rather than extra columns on blocklogs, for two reasons. The reader
+    /// in RollbackBreaks does positional reads off SELECT *, so widening that table invites
+    /// a silent column shift. And the panel has its own fixed expectations about blocklogs'
+    /// shape. A new table is additive for every existing consumer.
+    ///
+    /// containerid is the useful part: it is the same inventory id containerlogs uses, so a
+    /// manifest joins straight onto the history of who had been putting things in and
+    /// taking things out of that exact chest.
+    ///
+    /// x/y/z are spawn-relative, matching blocklogs rather than containerlogs' absolute
+    /// inventory ids, so a snapshot pairs with the BROKE row beside it without an offset.
+    /// </summary>
+    private string createContainerSnapshotsTable = @"CREATE TABLE IF NOT EXISTS containersnapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp_utc INTEGER,
+        player_id INTEGER NULL,
+        actiontype INTEGER,
+        block TEXT,
+        containerid TEXT NULL,
+        x INTEGER,
+        y INTEGER,
+        z INTEGER,
+        slot_count INTEGER,
+        total_items INTEGER,
+        manifest_data BLOB NULL,
+        manifest_encoding INTEGER NOT NULL DEFAULT 0
+    )";
 
     public enum ActionType {
         BROKE = 0,
@@ -73,7 +138,10 @@ public class Database : IDisposable {
         SWAP = 6,
         SAME_ITEM = 7,
         SPAWNED = 8,
-        DESPAWNED = 9
+        DESPAWNED = 9,
+        JOINED = 10,
+        LEFT = 11,
+        SAID = 12
     }
 
     private static readonly Dictionary<string, int> ActionTypeMap = new Dictionary<string, int> {
@@ -86,7 +154,10 @@ public class Database : IDisposable {
         { "SWAP", (int)ActionType.SWAP },
         { "SAME_ITEM", (int)ActionType.SAME_ITEM },
         { "SPAWNED", (int)ActionType.SPAWNED },
-        { "DESPAWNED", (int)ActionType.DESPAWNED }
+        { "DESPAWNED", (int)ActionType.DESPAWNED },
+        { "JOINED", (int)ActionType.JOINED },
+        { "LEFT", (int)ActionType.LEFT },
+        { "SAID", (int)ActionType.SAID }
     };
 
     private static readonly Dictionary<int, string> ReverseActionTypeMap = new Dictionary<int, string> {
@@ -99,8 +170,22 @@ public class Database : IDisposable {
         { (int)ActionType.SWAP, "SWAP" },
         { (int)ActionType.SAME_ITEM, "SAME_ITEM" },
         { (int)ActionType.SPAWNED, "SPAWNED" },
-        { (int)ActionType.DESPAWNED, "DESPAWNED" }
+        { (int)ActionType.DESPAWNED, "DESPAWNED" },
+        { (int)ActionType.JOINED, "JOINED" },
+        { (int)ActionType.LEFT, "LEFT" },
+        { (int)ActionType.SAID, "SAID" }
     };
+
+    /// <summary>
+    /// Where the database lives, for the read-only query paths that open their own
+    /// connection rather than queueing onto the single writer thread.
+    /// </summary>
+    public string DbPath => dbPath;
+
+    /// <summary>Label for a stored action id, or the raw number if it is one we do not know.</summary>
+    public static string NameForAction(int action) {
+        return ReverseActionTypeMap.TryGetValue(action, out string name) ? name : "ACTION_" + action;
+    }
 
     public Database() {
         dbPath = Path.GetFullPath(Path.Combine(Main.API.GetOrCreateDataPath("GriefWarden"), "database.db"));
@@ -125,6 +210,12 @@ public class Database : IDisposable {
                 cmd.CommandText = createEntityLogsTable;
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = createContainerLogsTable;
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = createSessionsTable;
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = createChatLogsTable;
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = createContainerSnapshotsTable;
                 cmd.ExecuteNonQuery();
 
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_blocklogs_coords ON blocklogs(x, y, z);";
@@ -153,6 +244,27 @@ public class Database : IDisposable {
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_containerlogs_pid_ts ON containerlogs(player_id, timestamp_utc);";
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_containerlogs_act_ts ON containerlogs(actiontype, timestamp_utc);";
+                cmd.ExecuteNonQuery();
+
+                // Presence and chat are always asked about as "this player, around this
+                // time", so both indices lead on the pair rather than on either alone.
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp_utc);";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_sessions_pid_ts ON sessions(player_id, timestamp_utc);";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_chatlogs_ts ON chatlogs(timestamp_utc);";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_chatlogs_pid_ts ON chatlogs(player_id, timestamp_utc);";
+                cmd.ExecuteNonQuery();
+
+                // Snapshots are reached two ways: from the position of a break being
+                // investigated, and from the container id when following one chest's whole
+                // history.
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_snapshots_coords ON containersnapshots(x, y, z);";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_snapshots_cid ON containersnapshots(containerid);";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON containersnapshots(timestamp_utc);";
                 cmd.ExecuteNonQuery();
             }
         }
@@ -294,104 +406,11 @@ public class Database : IDisposable {
         });
     }
 
-    public void RollbackBreaks(IServerPlayer player, int groupId, int x, int y, int z, int radius, string playername) {
-        // Read on a separate thread/connection to not block main thread
-        System.Threading.Tasks.Task.Run(() => {
-            using var connection = new SqliteConnection("Data Source=" + dbPath);
-            connection.Open();
+    // RollbackBreaks moved to Rollback.cs, where it gained a time window, a dry run, a
+    // refusal report and a check that it is not about to overwrite somebody's rebuild. The
+    // old one had none of those and restored by numeric block id.
 
-            using var cmd = connection.CreateCommand();
-
-            long playerid = -1;
-            cmd.CommandText = @"SELECT id FROM players
-            WHERE last_playername = $playername";
-            cmd.Parameters.AddWithValue("$playername", playername);
-            using (var reader = cmd.ExecuteReader()) {
-                if (reader.HasRows) {
-                    while (reader.Read()) {
-                        playerid = reader.GetInt64(0);
-                        break;
-                    }
-                }
-                else {
-                    Main.API.Event.EnqueueMainThreadTask(() => {
-                        Main.API.SendMessage(player, GlobalConstants.InfoLogChatGroup, "No player logged with that username.", EnumChatType.CommandSuccess);
-                    }, "SendRollbackFail");
-                    return;
-                }
-            }
-
-            cmd.CommandText = @"SELECT * FROM blocklogs
-            WHERE player_id = $playerid
-            AND actiontype = 0
-            AND x BETWEEN $x - $radius AND $x + $radius
-            AND y BETWEEN $y - $radius AND $y + $radius
-            AND z BETWEEN $z - $radius AND $z + $radius";
-
-            cmd.Parameters.AddWithValue("$x", x);
-            cmd.Parameters.AddWithValue("$y", y);
-            cmd.Parameters.AddWithValue("$z", z);
-            cmd.Parameters.AddWithValue("$radius", radius);
-            cmd.Parameters.AddWithValue("$playerid", playerid);
-
-            Dictionary<string, (BlockPos, long, int)> rollbackToSet = new();
-
-            var logs = new List<string>();
-            using (var reader = cmd.ExecuteReader()) {
-                if (reader.HasRows) {
-                    while (reader.Read()) {
-                        long tsSeconds = reader.GetInt64(1);
-
-                        string block = reader.IsDBNull(4) ? "" : reader.GetString(4);
-                        if (block.Contains("chiseled"))
-                            continue;
-
-                        int indexOfIDChar = block.IndexOf('/');
-                        if (indexOfIDChar == -1)
-                            continue;
-                        string blockIDStr = block.Substring(indexOfIDChar + 1, block.Length - indexOfIDChar - 1);
-
-                        int blockID = Convert.ToInt32(blockIDStr);
-                        if (blockID == 0)
-                            continue;
-
-                        int logX = reader.GetInt32(7);
-                        int logY = reader.GetInt32(8);
-                        int logZ = reader.GetInt32(9);
-
-                        string currentRollbackValueKey = logX + "|" + logY + "|" + logZ;
-                        try {
-                            (BlockPos, long, int) currentRollbackValue = rollbackToSet[currentRollbackValueKey];
-                            if (currentRollbackValue.Item2 > tsSeconds) {
-                                BlockPos savedBlockPos = rollbackToSet[currentRollbackValueKey].Item1;
-                                rollbackToSet[currentRollbackValueKey] = (savedBlockPos, tsSeconds, blockID);
-                            }
-                        }
-                        catch (KeyNotFoundException) {
-                            BlockPos blockPos = new BlockPos(logX + (int)Main.API.World.DefaultSpawnPosition.X, logY, logZ + (int)Main.API.World.DefaultSpawnPosition.Z);
-                            rollbackToSet[currentRollbackValueKey] = (blockPos, tsSeconds, blockID);
-                        }
-                    }
-                    logs.Add("Rolled back blocks broken by " + playername + " in a radius of " + radius + ".");
-                }
-                else {
-                    logs.Add("Nothing to rollback.");
-                }
-            }
-
-            Main.API.Event.EnqueueMainThreadTask(() => {
-                foreach (KeyValuePair<string, (BlockPos, long, int)> entry in rollbackToSet) {
-                    Main.API.World.BlockAccessor.SetBlock(entry.Value.Item3, entry.Value.Item1);
-                }
-
-                foreach (var log in logs) {
-                    Main.API.SendMessage(player, GlobalConstants.InfoLogChatGroup, log, EnumChatType.CommandSuccess);
-                }
-            }, "SendRollback");
-        });
-    }
-
-    public void CheckBlockLog(int pageNum, IServerPlayer player, int groupId, int x, int y, int z, int radius) {
+    public void CheckBlockLog(int pageNum, IServerPlayer player, int groupId, int x, int y, int z, int radius, long sinceUnix = 0) {
         // Read on a separate thread/connection to not block main thread
         System.Threading.Tasks.Task.Run(() => {
             using var connection = new SqliteConnection("Data Source=" + dbPath);
@@ -404,6 +423,7 @@ public class Database : IDisposable {
             WHERE x BETWEEN $x - $radius AND $x + $radius
             AND y BETWEEN $y - $radius AND $y + $radius
             AND z BETWEEN $z - $radius AND $z + $radius
+            AND timestamp_utc >= $since
             ORDER BY id DESC
             LIMIT $loglimit
             OFFSET $skiplognum) b
@@ -416,6 +436,7 @@ public class Database : IDisposable {
             cmd.Parameters.AddWithValue("$radius", radius);
             cmd.Parameters.AddWithValue("$loglimit", logLimit);
             cmd.Parameters.AddWithValue("$skiplognum", skipLogsNum);
+            cmd.Parameters.AddWithValue("$since", sinceUnix);
 
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
@@ -430,7 +451,7 @@ public class Database : IDisposable {
                     logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
-                        string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+                        string timestamp = Util.FormatTimestamp(tsSeconds);
 
                         string? playername = reader.IsDBNull(2) ? null : reader.GetString(2);
                         string? playeruid = reader.IsDBNull(3) ? null : reader.GetString(3);
@@ -492,7 +513,7 @@ public class Database : IDisposable {
         });
     }
 
-    public void CheckEntityLog(int pageNum, IServerPlayer player, int groupId, int x, int y, int z, int radius) {
+    public void CheckEntityLog(int pageNum, IServerPlayer player, int groupId, int x, int y, int z, int radius, long sinceUnix = 0) {
         System.Threading.Tasks.Task.Run(() => {
             using var connection = new SqliteConnection("Data Source=" + dbPath);
             connection.Open();
@@ -504,6 +525,7 @@ public class Database : IDisposable {
             WHERE x BETWEEN $x - $radius AND $x + $radius
             AND y BETWEEN $y - $radius AND $y + $radius
             AND z BETWEEN $z - $radius AND $z + $radius
+            AND timestamp_utc >= $since
             ORDER BY id DESC
             LIMIT $loglimit
             OFFSET $skiplognum) e
@@ -516,6 +538,7 @@ public class Database : IDisposable {
             cmd.Parameters.AddWithValue("$radius", radius);
             cmd.Parameters.AddWithValue("$loglimit", logLimit);
             cmd.Parameters.AddWithValue("$skiplognum", skipLogsNum);
+            cmd.Parameters.AddWithValue("$since", sinceUnix);
 
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
@@ -530,7 +553,7 @@ public class Database : IDisposable {
                     logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
-                        string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+                        string timestamp = Util.FormatTimestamp(tsSeconds);
 
                         string? playername = reader.IsDBNull(2) ? null : reader.GetString(2);
                         string? playeruid = reader.IsDBNull(3) ? null : reader.GetString(3);
@@ -601,7 +624,7 @@ public class Database : IDisposable {
                     logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
-                        string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+                        string timestamp = Util.FormatTimestamp(tsSeconds);
 
                         string? playername = reader.IsDBNull(2) ? null : reader.GetString(2);
                         string? playeruid = reader.IsDBNull(3) ? null : reader.GetString(3);
@@ -687,11 +710,90 @@ public class Database : IDisposable {
         });
     }
 
-    public void CheckContainerLog(int pageNum, IServerPlayer player, int groupId, string containerid) {
-        CheckContainerLog(pageNum, player, groupId, new List<string> { containerid });
+    /// <summary>
+    /// Records the contents a container had when it was destroyed. Always a BROKE: a
+    /// snapshot only exists because something stopped existing.
+    /// </summary>
+    public void AddContainerSnapshot(string? playername, string? playeruid, string block, string? containerid,
+                                     int x, int y, int z, int slotCount, int totalItems, string manifest) {
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        databaseTasks.Enqueue((connection) => {
+            int playerId = GetOrInsertPlayer(connection, playername, playeruid);
+            var compressed = CompressText(manifest);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"INSERT INTO containersnapshots (timestamp_utc, player_id, actiontype, block, containerid, x, y, z, slot_count, total_items, manifest_data, manifest_encoding)
+            VALUES ($timestamp, $player_id, $actiontype, $block, $containerid, $x, $y, $z, $slot_count, $total_items, $manifest_data, $manifest_encoding)";
+
+            cmd.Parameters.AddWithValue("$timestamp", timestamp);
+            cmd.Parameters.AddWithValue("$player_id", playerId == -1 ? DBNull.Value : playerId);
+            cmd.Parameters.AddWithValue("$actiontype", (int)ActionType.BROKE);
+            cmd.Parameters.AddWithValue("$block", block);
+            cmd.Parameters.AddWithValue("$containerid", containerid ?? (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("$x", x);
+            cmd.Parameters.AddWithValue("$y", y);
+            cmd.Parameters.AddWithValue("$z", z);
+            cmd.Parameters.AddWithValue("$slot_count", slotCount);
+            cmd.Parameters.AddWithValue("$total_items", totalItems);
+            cmd.Parameters.AddWithValue("$manifest_data", compressed.data ?? (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("$manifest_encoding", compressed.encoding);
+
+            cmd.ExecuteNonQuery();
+        });
     }
 
-    public void CheckContainerLog(int pageNum, IServerPlayer player, int groupId, List<string> containerids) {
+    /// <summary>Records a join or a disconnect. actiontype is JOINED or LEFT.</summary>
+    public void AddSessionLog(string? playername, string? playeruid, string actiontype) {
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        databaseTasks.Enqueue((connection) => {
+            int playerId = GetOrInsertPlayer(connection, playername, playeruid);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"INSERT INTO sessions (timestamp_utc, player_id, actiontype)
+            VALUES ($timestamp, $player_id, $actiontype)";
+
+            cmd.Parameters.AddWithValue("$timestamp", timestamp);
+            cmd.Parameters.AddWithValue("$player_id", playerId == -1 ? DBNull.Value : playerId);
+            cmd.Parameters.AddWithValue("$actiontype", ActionTypeMap.TryGetValue(actiontype, out int val) ? val : (int)ActionType.JOINED);
+
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    /// <summary>
+    /// Records one public chat line.
+    ///
+    /// The message arrives from the engine already formatted for broadcast, so it can carry
+    /// the speaker's name and VTML markup. It is stored as handed over rather than cleaned,
+    /// because a log that quietly rewrites what someone said is worse than one that is
+    /// occasionally ugly to read.
+    /// </summary>
+    public void AddChatLog(string? playername, string? playeruid, int channel, string message) {
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        databaseTasks.Enqueue((connection) => {
+            int playerId = GetOrInsertPlayer(connection, playername, playeruid);
+            var compressed = CompressText(message);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = @"INSERT INTO chatlogs (timestamp_utc, player_id, channel, message_data, message_encoding, actiontype)
+            VALUES ($timestamp, $player_id, $channel, $message_data, $message_encoding, $actiontype)";
+
+            cmd.Parameters.AddWithValue("$timestamp", timestamp);
+            cmd.Parameters.AddWithValue("$player_id", playerId == -1 ? DBNull.Value : playerId);
+            cmd.Parameters.AddWithValue("$channel", channel);
+            cmd.Parameters.AddWithValue("$message_data", compressed.data ?? (object)DBNull.Value);
+            cmd.Parameters.AddWithValue("$message_encoding", compressed.encoding);
+            cmd.Parameters.AddWithValue("$actiontype", (int)ActionType.SAID);
+
+            cmd.ExecuteNonQuery();
+        });
+    }
+
+    public void CheckContainerLog(int pageNum, IServerPlayer player, int groupId, string containerid, long sinceUnix = 0) {
+        CheckContainerLog(pageNum, player, groupId, new List<string> { containerid }, sinceUnix);
+    }
+
+    public void CheckContainerLog(int pageNum, IServerPlayer player, int groupId, List<string> containerids, long sinceUnix = 0) {
         System.Threading.Tasks.Task.Run(() => {
             using var connection = new SqliteConnection("Data Source=" + dbPath);
             connection.Open();
@@ -706,11 +808,12 @@ public class Database : IDisposable {
             string containerIDsQueryStr = sb.ToString();
 
             using var cmd = connection.CreateCommand();
-            cmd.CommandText = "SELECT c.id, c.timestamp_utc, p.last_playername, p.playeruid, c.containerid, c.itemstack_data, c.itemstack_encoding, c.quantity, c.actiontype FROM (SELECT * FROM containerlogs WHERE containerid = " + containerIDsQueryStr +
-                " ORDER BY id DESC LIMIT $loglimit OFFSET $skiplognum) c LEFT JOIN players p ON c.player_id = p.id ORDER BY c.id ASC";
+            cmd.CommandText = "SELECT c.id, c.timestamp_utc, p.last_playername, p.playeruid, c.containerid, c.itemstack_data, c.itemstack_encoding, c.quantity, c.actiontype FROM (SELECT * FROM containerlogs WHERE (containerid = " + containerIDsQueryStr +
+                ") AND timestamp_utc >= $since ORDER BY id DESC LIMIT $loglimit OFFSET $skiplognum) c LEFT JOIN players p ON c.player_id = p.id ORDER BY c.id ASC";
 
             cmd.Parameters.AddWithValue("$loglimit", logLimit);
             cmd.Parameters.AddWithValue("$skiplognum", skipLogsNum);
+            cmd.Parameters.AddWithValue("$since", sinceUnix);
 
             var logs = new List<string>();
             using (var reader = cmd.ExecuteReader()) {
@@ -725,7 +828,7 @@ public class Database : IDisposable {
                     logs.Add("<strong><font color=\"white\">              <a href=\"chattype://" + backPageCmdStr + "\">←←←</a> | <a href=\"chattype://" + forwardPageCmdStr + "\">→→→</a></font></strong>");
                     while (reader.Read()) {
                         long tsSeconds = reader.GetInt64(1);
-                        string timestamp = DateTimeOffset.FromUnixTimeSeconds(tsSeconds).UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+                        string timestamp = Util.FormatTimestamp(tsSeconds);
 
                         string logPlayername = reader.IsDBNull(2) ? "Unknown" : reader.GetString(2);
                         string logPlayeruid = reader.IsDBNull(3) ? "Unknown" : reader.GetString(3);
@@ -768,6 +871,56 @@ public class Database : IDisposable {
     /// </summary>
     public void EnqueueMaintenance(Action<SqliteConnection> task) {
         databaseTasks.Enqueue(task);
+    }
+
+    /// <summary>
+    /// Writes a consistent copy of the whole database to snapshot.db beside it, for anything
+    /// that wants to read the log off-server.
+    ///
+    /// Copying database.db while the server runs does not work and does not fail cleanly.
+    /// WAL mode means the newest events live in the -wal sidecar, so a copy of the main file
+    /// alone is quietly hours stale; copying both catches them at different instants, and a
+    /// copy taken mid-checkpoint has a header page count lower than the file's real length,
+    /// which presents as "database disk image is malformed" on whichever table happened to
+    /// be growing. That exact failure cost an investigation on 2026-10-08 a hand-patched
+    /// header before the container log would open at all.
+    ///
+    /// VACUUM INTO is the supported answer: one statement, one consistent file, the wal
+    /// already folded in. It runs on the writer thread, so it is serialised against every
+    /// insert for free.
+    ///
+    /// Written to a temporary name and moved into place, so a puller can never catch a
+    /// half-written snapshot. VACUUM INTO refuses to write to a file that already exists,
+    /// which the temp name also sidesteps.
+    /// </summary>
+    public void Snapshot(Action<string> report) {
+        string target = Path.Combine(Path.GetDirectoryName(dbPath)!, "snapshot.db");
+        string temp = target + ".tmp";
+
+        EnqueueMaintenance(connection => {
+            try {
+                if (File.Exists(temp)) File.Delete(temp);
+
+                using (var cmd = connection.CreateCommand()) {
+                    // Parameters are not allowed in VACUUM INTO, so the path is quoted by
+                    // doubling any single quote. It is a server-local path built here, never
+                    // anything a player supplied.
+                    cmd.CommandText = "VACUUM INTO '" + temp.Replace("'", "''") + "'";
+                    cmd.ExecuteNonQuery();
+                }
+
+                File.Move(temp, target, true);
+                long bytes = new FileInfo(target).Length;
+                report($"Snapshot written: {target} ({bytes / 1048576.0:0.0} MB). Pull this rather than database.db.");
+                Main.API.Logger.Notification($"GriefWarden: snapshot written ({bytes} bytes)");
+            }
+            catch (Exception ex) {
+                // VACUUM INTO needs SQLite 3.27 or newer. If the bundled provider is older
+                // this is where that shows up, and saying so beats a silent absence.
+                Main.API.Logger.Error("GriefWarden: snapshot failed: " + ex);
+                report("Snapshot failed: " + ex.Message);
+            }
+        });
     }
 
     /// <summary>Current file size on disk, for the retention size backstop.</summary>
