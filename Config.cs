@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace GriefWarden;
 
@@ -108,27 +108,6 @@ public class GriefWardenConfig {
     /// </summary>
     public bool LogSessions = true;
 
-    /// <summary>
-    /// Record public chat.
-    ///
-    /// Rulings turn on what was said and when, and the server's own chat log is a separate
-    /// file with no shared index, so correlating it with the event log is manual work every
-    /// single time. Storing it beside the events makes "what was said while this was
-    /// happening" one query.
-    ///
-    /// Off is a legitimate choice. This is the most personal data the mod touches, which is
-    /// also why it gets its own shorter retention below rather than riding the evidence tier.
-    /// </summary>
-    public bool LogChat = true;
-
-    /// <summary>
-    /// How long to keep chat. Deliberately short and separate from everything else.
-    ///
-    /// Chat earns its place by explaining events that are being investigated now. It does
-    /// not earn an indefinite transcript of a community talking, so this does not inherit
-    /// the 90-day evidence window even though the events it explains do.
-    /// </summary>
-    public int ChatRetentionDays = 21;
 
     // ----------------------------------------------------------------- fire guard
     /// <summary>
@@ -169,7 +148,6 @@ public class GriefWardenConfig {
         // rather than obey: this is the one setting where a typo is unrecoverable.
         if (DestructiveRetentionDays < 1) DestructiveRetentionDays = 1;
         if (ContextRetentionDays < 1) ContextRetentionDays = 1;
-        if (ChatRetentionDays < 1) ChatRetentionDays = 1;
         if (LogPageSize < 1) LogPageSize = 1;
         if (LogPageSize > 50) LogPageSize = 50;   // beyond this the client drops chat lines
         if (DefaultWindowHours < 1) DefaultWindowHours = 1;

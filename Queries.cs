@@ -20,16 +20,13 @@ namespace GriefWarden;
 ///
 /// Three things are deliberately different from the original read paths:
 ///
-///   - A player timeline merges all five tables into one ordering. Block breaks, container
-///     takes, kills, logins and chat interleaved in time is what actually reconstructs an
-///     afternoon; five separate command outputs do not.
+///   - A player timeline merges the tables into one ordering. Block breaks, container
+///     takes, kills and logins interleaved in time is what actually reconstructs an
+///     afternoon; separate command outputs do not.
 ///   - Every read takes a time window. Without one, paging is theatre.
-///   - Claim context is attached to every row that has a position, because whose land it
-///     happened on is the fact the ruling turns on.
 ///
-/// Query work happens on a worker thread with its own connection, formatting and claim
-/// lookup happen on the main thread. That split is not stylistic: the claim list belongs to
-/// the engine and is not safe to walk off-thread, and only a page of rows ever needs it.
+/// Query work happens on a worker thread with its own connection; formatting and sending
+/// happen on the main thread.
 /// </summary>
 public class Queries {
     /// <summary>One event from any of the tables, before it has been turned into text.</summary>
@@ -94,10 +91,7 @@ public class Queries {
         SELECT timestamp_utc, 'session', actiontype, NULL, NULL, 0,
                0, 0, 0, 0, NULL, 0
           FROM sessions WHERE player_id = $pid AND timestamp_utc >= $since
-        UNION ALL
-        SELECT timestamp_utc, 'chat', actiontype, NULL, message_data, message_encoding,
-               0, 0, 0, 0, NULL, 0
-          FROM chatlogs WHERE player_id = $pid AND timestamp_utc >= $since";
+";
 
     private List<Row> TimelineForPlayer(SqliteConnection connection, Who who, long sinceUnix, int pageNum, int[]? actionFilter) {
         int pageSize = Main.Config.LogPageSize;
@@ -297,10 +291,6 @@ public class Queries {
 
     /// <summary>
     /// Runs a read off the main thread, then formats and sends on it.
-    ///
-    /// The formatting half has to be on the main thread because claim lookup walks the
-    /// engine's claim list. Only one page of rows is ever annotated, so the main thread pays
-    /// almost nothing for it.
     /// </summary>
     private void Run(IServerPlayer caller, int groupId, Func<List<Row>> work) {
         System.Threading.Tasks.Task.Run(() => {
@@ -362,40 +352,15 @@ public class Queries {
                     sb.Append($" at <font color=\"#9BD1EC\">{row.X}, {row.Y}, {row.Z}</font>");
                     break;
 
-                case "chat":
-                    sb.Append($"\"{row.Item}\"");
-                    break;
 
                 case "session":
                     sb.Append(row.Actor);
                     break;
             }
 
-            string? claim = ClaimContext(row);
-            if (claim != null) sb.Append($" <font color=\"#C8C8C8\">[{claim}]</font>");
-
             lines.Add(sb.ToString());
         }
         return lines;
-    }
-
-    /// <summary>
-    /// Claim verdict for a row, or null when the row has no position or the position is
-    /// unclaimed. Container rows carry absolute coordinates inside the inventory id; block
-    /// and entity rows carry spawn-relative ones and have to be converted.
-    /// </summary>
-    private string? ClaimContext(Row row) {
-        try {
-            BlockPos? pos = row.HasPosition
-                ? Claims.ToAbsolute(row.X, row.Y, row.Z)
-                : Claims.PositionFromContainerId(row.ContainerId);
-            if (pos == null) return null;
-            return Claims.Describe(pos, row.ActorUid);
-        }
-        catch (Exception ex) {
-            Main.API.Logger.Warning("GriefWarden: claim lookup failed: " + ex.Message);
-            return null;
-        }
     }
 
     /// <summary>

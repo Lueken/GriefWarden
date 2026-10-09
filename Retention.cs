@@ -1,4 +1,4 @@
-using Microsoft.Data.Sqlite;
+﻿using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
 
@@ -32,13 +32,12 @@ public class Retention {
 
     // Tables where every row is the same class of thing, so the whole table shares one
     // cutoff. Sessions ride the evidence window because presence is what pairs with an old
-    // break; chat gets its own shorter window because a transcript of a community talking
-    // is not something to keep for a quarter on the chance it becomes relevant.
-    private static readonly string[] WholeTable = { "sessions", "chatlogs", "containersnapshots" };
+    // break.
+    private static readonly string[] WholeTable = { "sessions", "containersnapshots" };
 
     // Everything, for the size backstop only.
     private static readonly string[] AllTables = {
-        "blocklogs", "entitylogs", "containerlogs", "sessions", "chatlogs", "containersnapshots"
+        "blocklogs", "entitylogs", "containerlogs", "sessions", "containersnapshots"
     };
 
     private readonly GriefWardenConfig config;
@@ -58,7 +57,7 @@ public class Retention {
         Main.API.Event.RegisterGameTickListener(_ => Run("scheduled"), config.PruneIntervalHours * 3600 * 1000);
 
         Main.API.Logger.Notification(
-            $"GriefWarden: retention on. Destructive+presence {config.DestructiveRetentionDays}d, context {config.ContextRetentionDays}d, chat {config.ChatRetentionDays}d, ceiling {config.MaxDatabaseMb} MB."
+            $"GriefWarden: retention on. Destructive+presence {config.DestructiveRetentionDays}d, context {config.ContextRetentionDays}d, ceiling {config.MaxDatabaseMb} MB."
         );
     }
 
@@ -87,7 +86,6 @@ public class Retention {
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         long destructiveCutoff = now - (long)config.DestructiveRetentionDays * 86400;
         long contextCutoff = now - (long)config.ContextRetentionDays * 86400;
-        long chatCutoff = now - (long)config.ChatRetentionDays * 86400;
 
         var deleted = new Dictionary<string, int>();
         int total = 0;
@@ -103,8 +101,7 @@ public class Retention {
         }
 
         foreach (string table in WholeTable) {
-            long cutoff = table == "chatlogs" ? chatCutoff : destructiveCutoff;
-            total += deleted[table] = DeleteAllOlderThan(connection, table, cutoff);
+            total += deleted[table] = DeleteAllOlderThan(connection, table, destructiveCutoff);
         }
 
         if (total > 0) {
@@ -253,7 +250,7 @@ public class Retention {
     public string Describe() {
         if (!config.RetentionEnabled) return "Retention is disabled. The log grows without bound.";
         return $"Destructive (BROKE/KILLED/TAKEN) and presence kept {config.DestructiveRetentionDays} days, "
-             + $"chat {config.ChatRetentionDays} days, everything else {config.ContextRetentionDays} days, "
+             + $"everything else {config.ContextRetentionDays} days, "
              + $"ceiling {config.MaxDatabaseMb} MB, pruning every {config.PruneIntervalHours}h. "
              + $"Database is currently {Main.Database.FileSizeBytes() / 1048576.0:0.0} MB.";
     }

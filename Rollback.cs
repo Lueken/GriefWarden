@@ -1,4 +1,4 @@
-using Microsoft.Data.Sqlite;
+﻿using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -150,7 +150,9 @@ public class Rollback {
                 Timestamp = reader.GetInt64(0),
                 RawBlock = reader.IsDBNull(1) ? "" : reader.GetString(1),
                 LoggedId = reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
-                Pos = Claims.ToAbsolute(x, y, z),
+                Pos = new BlockPos(
+                    x + (int)Main.API.World.DefaultSpawnPosition.X, y,
+                    z + (int)Main.API.World.DefaultSpawnPosition.Z),
             };
             Classify(c);
             byPosition[key] = c;

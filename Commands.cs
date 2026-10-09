@@ -22,7 +22,7 @@ public class Commands {
         Main.API.RegisterCommand("griefwarden", "GriefWarden status, retention control and consistent snapshots.", "status | prune | snapshot | vacuum | fire", new ServerChatCommandDelegate(this.OnGriefWardenCommand), "griefwarden");
 
         // The question every dispute actually opens with, which had no command at all.
-        Main.API.RegisterCommand("playerlog", "Everything one player did, newest first. Merges blocks, containers, kills, logins and chat into one timeline.", "USERNAME [-t 6h] [-n page] [-sum] [-a BROKE,TAKEN]", new ServerChatCommandDelegate(this.OnPlayerLogCommand), "griefwarden");
+        Main.API.RegisterCommand("playerlog", "Everything one player did, newest first. Merges blocks, containers, kills and logins into one timeline.", "USERNAME [-t 6h] [-n page] [-sum] [-a BROKE,TAKEN]", new ServerChatCommandDelegate(this.OnPlayerLogCommand), "griefwarden");
         Main.API.RegisterCommand("itemlog", "Find an item by name across every container transaction in the window.", "ITEM NAME [-t 7d] [-n page]", new ServerChatCommandDelegate(this.OnItemLogCommand), "griefwarden");
         Main.API.RegisterCommand("wasonline", "Whether a player was connected at a given moment. Answers from the session log.", "USERNAME WHEN   (WHEN is 90m, 6h, 14:35, or 2026-10-08 14:35)", new ServerChatCommandDelegate(this.OnWasOnlineCommand), "griefwarden");
     }

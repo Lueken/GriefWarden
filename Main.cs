@@ -48,10 +48,6 @@ public class Main : ModSystem {
 
         new Commands();
 
-        // Quire-local: snapshots land claims beside the database so off-server analysis can
-        // tell a break on unclaimed fringe from a break in the middle of nowhere. Not part
-        // of the retention work meant for upstream.
-        new ClaimsExport();
 
         // Age-based pruning. Without it the four insert-only tables grow forever, which on a
         // busy server is measured in gigabytes a year.

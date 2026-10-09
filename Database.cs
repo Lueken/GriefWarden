@@ -82,22 +82,6 @@ public class Database : IDisposable {
         actiontype INTEGER
     )";
     /// <summary>
-    /// Public chat, stored beside the events it explains.
-    ///
-    /// The server already writes server-chat.log, but that file shares no index, no player
-    /// id and no query path with any of this, so every investigation that turns on
-    /// something said in chat means opening a second file and aligning it by eye.
-    /// </summary>
-    private string createChatLogsTable = @"CREATE TABLE IF NOT EXISTS chatlogs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp_utc INTEGER,
-        player_id INTEGER NULL,
-        channel INTEGER,
-        message_data BLOB NULL,
-        message_encoding INTEGER NOT NULL DEFAULT 0,
-        actiontype INTEGER
-    )";
-    /// <summary>
     /// What was inside a container when it was destroyed.
     ///
     /// A separate table rather than extra columns on blocklogs, for two reasons. The reader
@@ -140,8 +124,7 @@ public class Database : IDisposable {
         SPAWNED = 8,
         DESPAWNED = 9,
         JOINED = 10,
-        LEFT = 11,
-        SAID = 12
+        LEFT = 11
     }
 
     private static readonly Dictionary<string, int> ActionTypeMap = new Dictionary<string, int> {
@@ -156,8 +139,7 @@ public class Database : IDisposable {
         { "SPAWNED", (int)ActionType.SPAWNED },
         { "DESPAWNED", (int)ActionType.DESPAWNED },
         { "JOINED", (int)ActionType.JOINED },
-        { "LEFT", (int)ActionType.LEFT },
-        { "SAID", (int)ActionType.SAID }
+        { "LEFT", (int)ActionType.LEFT }
     };
 
     private static readonly Dictionary<int, string> ReverseActionTypeMap = new Dictionary<int, string> {
@@ -172,8 +154,7 @@ public class Database : IDisposable {
         { (int)ActionType.SPAWNED, "SPAWNED" },
         { (int)ActionType.DESPAWNED, "DESPAWNED" },
         { (int)ActionType.JOINED, "JOINED" },
-        { (int)ActionType.LEFT, "LEFT" },
-        { (int)ActionType.SAID, "SAID" }
+        { (int)ActionType.LEFT, "LEFT" }
     };
 
     /// <summary>
@@ -213,8 +194,6 @@ public class Database : IDisposable {
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = createSessionsTable;
                 cmd.ExecuteNonQuery();
-                cmd.CommandText = createChatLogsTable;
-                cmd.ExecuteNonQuery();
                 cmd.CommandText = createContainerSnapshotsTable;
                 cmd.ExecuteNonQuery();
 
@@ -246,15 +225,11 @@ public class Database : IDisposable {
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_containerlogs_act_ts ON containerlogs(actiontype, timestamp_utc);";
                 cmd.ExecuteNonQuery();
 
-                // Presence and chat are always asked about as "this player, around this
+                // Presence is always asked about as "this player, around this
                 // time", so both indices lead on the pair rather than on either alone.
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_sessions_ts ON sessions(timestamp_utc);";
                 cmd.ExecuteNonQuery();
                 cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_sessions_pid_ts ON sessions(player_id, timestamp_utc);";
-                cmd.ExecuteNonQuery();
-                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_chatlogs_ts ON chatlogs(timestamp_utc);";
-                cmd.ExecuteNonQuery();
-                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_chatlogs_pid_ts ON chatlogs(player_id, timestamp_utc);";
                 cmd.ExecuteNonQuery();
 
                 // Snapshots are reached two ways: from the position of a break being
@@ -760,34 +735,6 @@ public class Database : IDisposable {
         });
     }
 
-    /// <summary>
-    /// Records one public chat line.
-    ///
-    /// The message arrives from the engine already formatted for broadcast, so it can carry
-    /// the speaker's name and VTML markup. It is stored as handed over rather than cleaned,
-    /// because a log that quietly rewrites what someone said is worse than one that is
-    /// occasionally ugly to read.
-    /// </summary>
-    public void AddChatLog(string? playername, string? playeruid, int channel, string message) {
-        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        databaseTasks.Enqueue((connection) => {
-            int playerId = GetOrInsertPlayer(connection, playername, playeruid);
-            var compressed = CompressText(message);
-
-            using var cmd = connection.CreateCommand();
-            cmd.CommandText = @"INSERT INTO chatlogs (timestamp_utc, player_id, channel, message_data, message_encoding, actiontype)
-            VALUES ($timestamp, $player_id, $channel, $message_data, $message_encoding, $actiontype)";
-
-            cmd.Parameters.AddWithValue("$timestamp", timestamp);
-            cmd.Parameters.AddWithValue("$player_id", playerId == -1 ? DBNull.Value : playerId);
-            cmd.Parameters.AddWithValue("$channel", channel);
-            cmd.Parameters.AddWithValue("$message_data", compressed.data ?? (object)DBNull.Value);
-            cmd.Parameters.AddWithValue("$message_encoding", compressed.encoding);
-            cmd.Parameters.AddWithValue("$actiontype", (int)ActionType.SAID);
-
-            cmd.ExecuteNonQuery();
-        });
-    }
 
     public void CheckContainerLog(int pageNum, IServerPlayer player, int groupId, string containerid, long sinceUnix = 0) {
         CheckContainerLog(pageNum, player, groupId, new List<string> { containerid }, sinceUnix);
